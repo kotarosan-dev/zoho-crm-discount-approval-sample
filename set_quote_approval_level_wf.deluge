@@ -1,0 +1,13 @@
+// ============================================================
+// function_name : set_quote_approval_level_wf (automation wrapper)
+// purpose       : Lets a workflow rule run the standalone function
+//                 standalone.set_quote_approval_level. A workflow rule cannot
+//                 call a standalone function directly, so register this file as
+//                 an automation function and attach it to the workflow rule on
+//                 Quotes.
+// argument      : quoteId (String) - the quote's record ID, passed from the workflow
+//                 Note: this file holds only the function body. Add the declaration,
+//                 including the argument quoteId, in the Zoho CRM function editor.
+// related       : set_quote_approval_level.deluge (the function body that does the work)
+// ============================================================
+standalone.set_quote_approval_level(quoteId);

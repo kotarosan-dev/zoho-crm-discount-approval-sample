@@ -1,0 +1,781 @@
+// ============================================================
+// function_name : Set_Quote_Approval_Level（v7）
+// label_name    : 見積の値引き率から承認段階を設定する
+// 引数          : id (String) … ワークフローから渡す見積の record ID（${Quotes.Quotes Id}）
+//                 ※ 本ファイルは関数本体のみ。宣言（引数 id String）はエディタ側で付ける
+//                 ※ 宣言名は必ず小文字スネークケースにする: string standalone.set_quote_approval_level(string id)
+//                   （大文字混じりの宣言名だと他関数から参照できず "Not able to find" になる。2026-11-10 実測）
+//                 ※ ワークフローからは automation ラッパー Set_Quote_Approval_Level_WF 経由で呼ぶ。
+//                   ラッパー本体は1行: standalone.set_quote_approval_level(quoteId);
+// 戻り値        : string（処理結果の短い説明）
+//
+// motivation（目的）:
+//   見積の値引き・税・Adjustment から実効値引き率（True Discount %）を計算し、
+//   Discount_Percentage / Approval_Status / Approval_Level を書き込んで承認プロセスへ回す。
+//   評価できない・書き込みを確認できない場合は fail-closed で Needs Manual Review に倒す。
+//
+// v6 からの変更（v7。2026-11-13 の承認ロック実測に基づく最小変更）:
+//   理由: 承認プロセスへ投入されたレコードは、getRecordById が status だけの Map（HTTP 204。id キーが無い）を返して
+//      項目を読めない（2026-11-13 実測。投入直後だけでなく承認中は恒常的）。通常のレコードは 53 キーの完全な Map（id あり）。
+//      そのため主書き込み直後の読み戻し失敗は、承認ロックの正常な帰結でありうる。v6 ではこれを READBACK-MISMATCH と
+//      誤判定し、正しく承認プロセスへ投入されたテスト見積2件へ Needs Manual Review を上書きした（同日実測）。
+//   変更1（入口ガード）: ステップ1 の取得直後、応答が null か "id" キーを含まない Map なら承認中（または読めない状態）とみなし、
+//      mode = "SKIP"・reason "record not readable (in approval)" で何も書かずに終了する（failureKind は付けない。異常ではない）。
+//      ステップ2 の ABORT（FETCH-FAILED）は mode が未設定のときだけ代入するようにし、この SKIP を上書きしない。
+//   変更2（読み戻し分岐）: ステップ6 の読み戻し取得失敗のうち、目標が Pending Manager Approval / Pending VP Approval のものは
+//      異常にせず新しい mode "SUBMITTED" とする（NMR は書かない。failureKind・reason は付けない。ステップ7 は走らない）。
+//      結果は "OK <status> <pct> (submitted, read-back skipped)"。目標が Pending 以外の取得失敗と、読み戻し成功後の値の
+//      不一致は、従来どおり READBACK-MISMATCH で Needs Manual Review に倒す。
+//   「書いたら読み戻して突き合わせる」原則に対する例外: Pending 系の目標に限り、書き込み応答（updateRecord の応答に
+//      id があること）の成功をもって投入済みとし、読み戻し検証を保留する。それ以外は従来どおり読み戻して突き合わせる。
+//   ※ 開始ログの版表記は "v5" → "v7" にした（実行ログでどの版が動いたかを見分けるため。v5 の前例に従う）。
+//
+// v4 からの変更（v5。実測に基づく最小変更。変えたのは明細収集の部分だけ）:
+//   T5 明細値の形判定を廃し、生値の直接反復に変更した。
+//      v4 は Product_Details の toString() の先頭文字で形を判定し（"{" なら単一 Map として1行、"[" なら List）、
+//      複数行のテスト見積（2行）でも先頭が "{" だったため MAP と誤判定し、全体を1行に潰して1行目の税しか
+//      数えなかった（税 10000 のみ、正しくは 15000）。
+//      版指定なし getRecordById の Product_Details の生値を for each で直接反復すれば全行が取れることを
+//      実測した（2行のテスト見積で全2行・Tax 合計 15,000）。v5 はこの形にする:
+//        ・キーの有無と null だけを確かめ（従来どおり "Product_Details missing"／"Product_Details is null" で PD-SHAPE）、
+//          反復対象の変数（pdIter／fPdIter）は null で事前初期化せず、for each の直前に応答から直接代入する
+//          （保存が通った実績のある形）。
+//        ・各行は null でないことを確かめてから、行ごとの try/catch で toMap() に変換して pdRows／fPdRows に集める。
+//          変換で例外が出た行・null の行は fail-closed（PD-SHAPE。理由は v4 と同じ文言）。
+//        ・反復の結果 0 行なら PD-SHAPE（"Product_Details has no rows"）。
+//        ・税合計は、集めた Map の各行に v4 と同じ行処理（Tax キーの取得・null／空の確認・toDecimal・行単位の失敗記録）。
+//      廃止したもの: 明細値全体と各行への toString().startsWith("{")／startsWith("[") の判定、pdRows.add(pdRaw)／
+//      addAll(pdRaw)、理由 "Product_Details is neither Map nor List"（到達する経路が無くなった）。
+//      ステップ3a（初回計算）とステップ7（競合検知の再計算）の両方に同じ変更を入れた。
+//      それ以外（取得・必須キー・候補D の式・丸め・閾値・D9 ガード・書き込み・読み戻し・戻り値・ログ文言）は v4 から変更なし。
+//      ※ 開始ログの版表記だけは "v4" → "v5" にした（実行ログでどの版が動いたかを見分けるため）。
+//
+// v3 からの変更（v4。2026-11-10 の実測結果に基づく最小変更。v5 でも行変換は維持し、形判定は廃止）:
+//   T4 明細行を Map へ変換してからキー操作する（行変換）。
+//      v3 は1行のテスト見積の単体実行で、行への containKey("Tax") が「KEY-VALUE 型でない」型エラーで失敗した。
+//      v4 では各行について、null でないこと・toString() が "{" で始まることを確かめた後、
+//      try/catch の中で rowMap = pdRow.toMap() と変換し、以後の containKey("Tax")／get("Tax") は rowMap に対して行う。
+//      変換で例外が出た行は fail-closed（PD-SHAPE、理由 "Product_Details row conversion failed"）。
+//      ステップ3a（初回計算）とステップ7（競合検知の再計算。fPdRow → fRowMap）の両方に同じ変更を入れた。
+//      取得は v3 と同じく版指定なしの zoho.crm.getRecordById のまま（v8 指定でも行の型は同じだった）。
+//      それ以外（式・閾値・ステータス値・ガード・書き込み・読み戻し・競合検知の枠組み・A1／A3）は v3 から変更なし。
+//
+// v2 からの変更（v3 で実施。T1 は v5 でも維持。T2 の形の正規化と T3 の「Map でも List でもない」「行が Map でない」は v5 の T5 で廃止）:
+//   T1 税合計の取得元を「Product_Details の各行の Tax の合計」に差し替えた。
+//      v2 の A2（$line_tax の value 合計 → Tax キーのフォールバック → 0）は全廃した。
+//      ステップ3a（初回計算）とステップ7（競合検知の再計算）の両方を同じロジックにしている
+//      （Deluge は関数内関数を書けないため重複させている）。taxSource は "Product_Details.Tax"。
+//   T2 Product_Details の形を正規化する: toString() が "{" で始まれば単一 Map として1行扱い、
+//      "[" で始まれば List として各行を処理する。
+//   T3 以下はすべて fail-closed（Needs Manual Review、分類 PD-SHAPE）。税 0 で計算しない:
+//      Product_Details キーが無い / 値が null / Map でも List でもない / 行が 0 件（空の List）/
+//      行が Map でない / 行に Tax キーが無い / 行の Tax が null または空文字。
+//      ※「行が 0 件」は v3 で加えた安全側の判断（見積に明細が無いことは想定外で、税 0 で計算すると
+//        率が過小に出うるため）。
+//   検算ケース (6)〜(8) を Product_Details 形式に書き直し、(9) を追加した。
+//
+// v1 からの変更（v2 で実施。v3 でも維持。A2 は上記 T1 で置き換え済み）:
+//   A1 レコード単位のメール通知を全廃した（sendmail・notifyAdmin を削除）。
+//      v1 は「1実行＝1通」で、検証初日に FETCH-INCOMPLETE のメールが12通連発した。
+//      異常系は fail-closed で Needs Manual Review を書く（書ける場合）だけにし、
+//      管理者への通知は日次ダイジェスト関数 Quote_Approval_Review_Digest（1日最大1通）が担う。
+//      failureKind は info ログ用の分類文字列としてだけ残す（メールには使わない）。
+//      ADMIN_EMAIL 定数は、本関数から sendmail が無くなったため削除した（宛先はダイジェスト関数側で持つ）。
+//   A3 必須キー検査を Sub_Total だけにした。Sub_Total の欠落だけが FETCH-INCOMPLETE（fail-closed）。
+//      Discount / Adjustment は欠落時に 0 として扱う（ifnull）。
+//
+// 前提（2026-11-10 に実測済み。1行のテスト見積 = Record <record id>）:
+//   ・getRecordById（版指定なし）の応答のヘッダーに Tax キーは無い。$line_tax キーはあるが値は空だった。
+//     → 本組織ではヘッダーから税合計は取れない。
+//   ・税の所在は明細の各行。明細は Product_Details キーで応答に含まれる（Quoted_Items というキーは無い）。
+//   ・行 Map の実物（1行のテスト見積）: Tax 1000（行の税額）/ total 10000（税抜の行金額）/ total_after_discount 10000 /
+//     net_total 11000（税込の行合計）/ line_tax [{percentage:10, name:"消費税", value:1000}] / Discount 0 / quantity 1。
+//   ・整合: Σ net_total = Sub_Total（11000）、Sub_Total − Σ 行 Tax = Σ total_after_discount（10000）。
+//     → 候補D の分母（Sub_Total − 税合計）は、税合計 = Σ 行 Tax で税抜合計に一致する。
+//   ・明細値の toString() は、1行でも複数行でも先頭が "{" になる（複数行は `{行1},{行2}` の形。
+//     2行のテスト見積 = Record <record id>）。先頭文字では単一 Map と複数行を区別できない。
+//     （v4 の前提「明細1行の見積では単一 Map で返る」は、この形の1行ケースを見ていたもの）
+//   ・Product_Details の生値を for each で直接反復すると全行が取れる（2行のテスト見積で全2行・Tax 合計 15,000）。
+//   ・明細行は KEY-VALUE 型ではなく、toMap() で変換が要る（2026-11-10 実測）。
+//     行のまま containKey を呼ぶと KEY-VALUE 型エラー、get("Tax") も型エラーになる。
+//     row.toMap() で本物の Map になり、変換後は containKey("Tax")=true、get("Tax")=1000 が取れた（実測で確認）。
+//     行を文字列化してからの toMap も成功した（実測。v4・v5 では採用せず、行の toMap() を直接使う）。
+//     putAll では変換できない。
+//   未実測（確定事項として扱わないこと）:
+//   ・明細1行のテスト見積で、生値の直接反復が1行の行として回ること（第6弾の実測は2行のテスト見積）。
+//     1行で反復の単位が行にならず toMap() が失敗する場合は、T5 により PD-SHAPE（row conversion failed）で
+//     fail-closed になる。1行のテスト見積の単体実行で確認すること。
+//   ・Product_Details の値が反復できない型だった場合、for each 自体が実行時エラーになりうる（実測例は無い）。
+//     → 解消済み: ステップ3a・ステップ7 の収集ループ全体を try で囲み、反復そのものが失敗しても PD-SHAPE
+//       （理由 "Product_Details iteration failed"。ループ内で既に理由が設定されていればそちらを優先）として
+//       Needs Manual Review が書かれる。例外内容は info に出す。
+//       ※ try の入れ子（ループ側の try の中に行ごとの try）が保存・実行で通ることは未実測。保存時に確認すること。
+//
+// 計算式（候補D。v1 から変更なし。変えたのは Tax の取得元だけ）:
+//   discountAmount = Discount − min(Adjustment, 0)
+//   denominator    = Sub_Total − Tax（Tax は Product_Details の各行の Tax の合計 taxTotal）
+//   rawPct         = discountAmount / denominator × 100
+//   pct            = rawPct.round(2)   … 判定にも保存にも pct を使う（D3）
+//
+// 判定（閾値は関数内定数。v1 から変更なし）:
+//   pct < 10        → Approval_Status "Auto Approved"            / Approval_Level "None - Auto Approved"
+//   10 ≤ pct < 20   → Approval_Status "Pending Manager Approval" / Approval_Level "Sales Manager"
+//   pct ≥ 20        → Approval_Status "Pending VP Approval"      / Approval_Level "VP Sales"
+//
+// fail-closed（Needs Manual Review / Manual Review。Discount_Percentage は書かない。メールは送らない）:
+//   Sub_Total が応答に無い（FETCH-INCOMPLETE）/ Product_Details の形が想定外（PD-SHAPE。条件は下記）/
+//   分母 ≤ 0（DENOMINATOR）/ pct が [0,100] の範囲外（OUT-OF-RANGE）/ updateRecord エラー（UPDATE-ERROR）/
+//   読み戻し失敗・不一致（READBACK-MISMATCH）/ 競合検知（CONFLICT: 読み戻し値で再計算した率が保存した率と違う、
+//   または読み戻しの Product_Details が PD-SHAPE 条件に当たる）
+//   レコードが返らない（FETCH-FAILED）は書く先が無いので ABORT とし、info ログのみ。
+//   PD-SHAPE の条件（v5）: Product_Details キーが無い / 値が null / 反復した行が null / 行の toMap() で例外 /
+//   反復の結果 0 行 / 行に Tax キーが無い / 行の Tax が null または空文字。税 0 で計算しない。
+//
+// 通知について:
+//   本関数はメールを送らない。Needs Manual Review になった見積は、日次ダイジェスト
+//   Quote_Approval_Review_Digest が直近24時間分を集計して管理者へ 1日最大1通で知らせる。
+//   ダイジェストに載らないもの（Approval_Status が書かれないため）: ABORT（FETCH-FAILED）と、
+//   Needs Manual Review 自体の書き込み失敗（REVIEW-WRITE-FAILED）。この2つは関数の実行ログ
+//   （info と失敗一覧）でだけ見える。
+//
+// 状態ガード（D9。v1 から変更なし）:
+//   (a) 保存済み Approval_Status = Approved かつ pct = 保存済み Discount_Percentage → 何も書かず終了
+//   (b) 保存済み Approval_Status = Rejected かつ pct = 保存済み Discount_Percentage
+//       かつ 判定した段階 = 保存済み Approval_Level → 何も書かず終了
+//
+// processing_flow:
+//   1 id.toLong() で取得 → 2 取得検査（Sub_Total のみ必須）→ 3a 税合計の算出（Product_Details の生値を直接反復し、各行を toMap() で変換して集め、行 Tax を合計）→
+//   3b 計算・ガード → 4 判定・状態ガード → 5 updateRecord（trigger に approval を明示）→ 6 読み戻し検査 →
+//   7 競合検知（同じ税ロジック）→ 8 必要なら Needs Manual Review を書く → 結果をログに出して return
+//
+// 検算ケース（期待値。手計算）:
+//   ※ (1)〜(5) の「Tax」は「Product_Details の各行の Tax の合計」と読み替える（入力の意味が変わっただけで期待値は v2 と同じ）。
+//   (1) ST 10000 / Disc 900  / Tax 0    / Adj 0    → 900 / 10000 × 100  = 9.00  → Auto Approved / None - Auto Approved
+//   (2) ST 11000 / Disc 1100 / Tax 1000 / Adj 0    → 1100 / 10000 × 100 = 11.00 → Pending Manager Approval / Sales Manager
+//   (3) ST 11000 / Disc 1000 / Tax 1000 / Adj −500 → (1000+500) / 10000 × 100 = 15.00 → Pending Manager Approval / Sales Manager
+//   (4) ST 10000 / Disc 2500 / Tax 0    / Adj 0    → 2500 / 10000 × 100 = 25.00 → Pending VP Approval / VP Sales
+//   (5) ST 1000  / Disc 0    / Tax 1000 / Adj 0    → 分母 0 → Needs Manual Review / Manual Review
+//       （Discount_Percentage は書かない。メールは送らない。日次ダイジェストに載る）
+//   (6) ST 11000 / Product_Details = {Tax:1000, total:10000, net_total:11000, ...}（単一 Map、行 Tax 合計 1000）/
+//       Disc 1000 / Adj −500
+//       → (1000+500) / (11000−1000) × 100 = 15.00 → Pending Manager Approval / Sales Manager（1行のテスト見積の実測形）
+//   (7) ST 10000 / Product_Details の行 Tax 合計 0（無税の行のみ。各行に Tax:0 がある）/ Disc 2000 / Adj 0
+//       → 税 0 として 2000 / 10000 × 100 = 20.00 → Pending VP Approval / VP Sales
+//   (8) ST 11000 / Product_Details キーが無い / Disc 1000 / Adj 0
+//       → PD-SHAPE → Needs Manual Review / Manual Review（Discount_Percentage は書かない）
+//   (9) ST 11000 / Product_Details = {total:10000, net_total:11000, ...}（行に Tax キーが無い）/ Disc 1000 / Adj 0
+//       → PD-SHAPE → Needs Manual Review / Manual Review（Discount_Percentage は書かない。税 0 で計算しない）
+//   (10) ST 11000 / Product_Details を反復した行のどれかが toMap() で例外 / Disc 1000 / Adj 0
+//       → PD-SHAPE（Product_Details row conversion failed）→ Needs Manual Review / Manual Review（T4・T5）
+//   (11) ST 165000 / Product_Details = 2行（行 Tax 10000 と 5000、合計 15000）/ Disc 1500 / Adj 0
+//       → 1500 / (165000−15000) × 100 = 1.00 → Auto Approved / None - Auto Approved
+//       （2行のテスト見積の実測形。v4 は1行目だけを数えて 0.97 になった。ログは 行数=2 合計=15000）
+//   (12) ST 11000 / Product_Details が空（反復しても 0 行）/ Disc 1000 / Adj 0
+//       → PD-SHAPE（Product_Details has no rows）→ Needs Manual Review / Manual Review
+//   ※ (6)(7)(9)(11) の行 Tax・Tax キーの有無は、v5 では反復で集めて toMap() で変換した後の Map で判定する。
+//
+// 実装上の注意（実測に基づく）:
+//   record ID は NUMBER 型 → 冒頭で id.toLong()。
+//        「版指定なしの getRecordById は見積・受注・請求の明細を読めなかった」とされるが、本組織の見積では
+//        明細が Product_Details キーで応答に含まれていた（2026-11-10 実測、1行のテスト見積）→ 明細行の Tax を読む
+//        明細の扱いの実測: 明細行は KEY-VALUE 型ではなく、行のままでは containKey／get が型エラーになる。
+//        toMap() で変換すれば読める（2026-11-10 実測）→ 各行を toMap() してからキー操作する
+//        明細の全行は Product_Details の生値を for each で直接反復して取る（実測）
+//   updateRecord は trigger に "approval" を明示し、承認プロセスの評価を起動する（v6 の変更。省略時も承認・Blueprint は動くとされるが、ワークフロー経由の自己更新では承認プロセスへ投入されなかった 2026-11-13 の実測を受けて明示指定に変えた）。空リストは承認も止めるので禁止
+//   書いたら読み戻して値そのものを突き合わせる（v7 の例外: 目標が Pending 系で読み戻しが承認ロックにより読めないときは、updateRecord の応答の id をもって投入済みとし検証を保留する）
+//   「行の税は Line_Tax」「書類全体の税は $line_tax」は v8 API の名称。Deluge 統合タスク（getRecordById）の
+//        応答では、行の税額キーは Tax、内訳配列は line_tax（$ なし）で、ヘッダーの $line_tax は空だった（実測）
+//        → 税合計は Product_Details の各行の Tax の合計で求める。
+//        小数0桁の項目に小数を送ると INVALID_DATA → Discount_Percentage は小数2桁の Percent 項目、round(2) で送る
+//   保存時に (x).method() の括弧が外される → 計算式は変数に入れてから round する
+//   三項演算子・行末コメント・文字列連結への式埋め込みは使わない。for each に渡す値は変数に入れてから渡す
+//        （pdIter／fPdIter に応答から直接代入し、その直後の for each に渡す）
+//   明細値の形判定に toString の先頭文字は使わない（実測で不成立を確認）。「リストかどうかは toString() が
+//        "[" で始まるかで見る」は、明細値には当てはまらなかった（複数行でも "{" 始まり）。
+//        v5 は形を判定せず、生値を直接反復する
+//   null にメソッドを呼ばない → Product_Details の値・反復した各行・行の Tax は null を確かめてから
+//        for each・toMap()・toString() 等に使う
+//   戻り値のある関数の try/catch → v5 の try/catch は収集ループ（反復失敗の捕捉）と行変換（toMap() と pdRows への
+//        追加）を囲む局所的なもので、中で return しない。return は従来どおり関数末尾の1か所（全経路がそこへ流れる）
+//   レイアウトから外した項目は応答に返らない → 必須キーは計算に不可欠な Sub_Total だけに絞る
+//
+// 注意（要確認）:
+//   ・standalone はワークフローから直接呼べない。ワークフローには automation ラッパー経由で付ける。
+//   ・再開時は、ワークフローを全レコード対象で有効化する前に、本関数の単一レコード実行を必ず挟む
+//     v5 は1行のテスト見積（期待 "OK Pending Manager Approval 15.00"、行数=1 合計=1000）と
+//     2行のテスト見積（期待 "OK Auto Approved 1.00"、行数=2 合計=15000）の両方で単体実行して確定する。
+//
+// related_functions: Set_Quote_Approval_Level_WF（automation ラッパー）、Quote_Approval_Review_Digest（日次ダイジェスト）
+// ============================================================
+
+// ---- 設定（組織ごとの変更点）----
+MANAGER_THRESHOLD = 10.00;
+VP_THRESHOLD = 20.00;
+ZERO = 0.00;
+HUNDRED = 100.00;
+STATUS_AUTO = "Auto Approved";
+STATUS_MANAGER = "Pending Manager Approval";
+STATUS_VP = "Pending VP Approval";
+STATUS_APPROVED = "Approved";
+STATUS_REJECTED = "Rejected";
+STATUS_REVIEW = "Needs Manual Review";
+LEVEL_AUTO = "None - Auto Approved";
+LEVEL_MANAGER = "Sales Manager";
+LEVEL_VP = "VP Sales";
+LEVEL_REVIEW = "Manual Review";
+// ---- 状態変数 ----
+// mode: NORMAL（通常書き込み）/ SUBMITTED（書き込み成功・承認ロックで読み戻し保留。v7）/ REVIEW（要手動確認）/ SKIP（書かない）/ ABORT（レコード無し）
+// failureKind: info ログ用の異常分類（メールには使わない）
+mode = "";
+reason = "";
+failureKind = "";
+pct = ZERO;
+newStatus = "";
+newLevel = "";
+recordId = id.toLong();
+info "開始: Set_Quote_Approval_Level v7 id=" + id;
+// ---- 1. 見積の取得 ----
+quote = zoho.crm.getRecordById("Quotes",recordId);
+recordExists = false;
+if(quote != null)
+{
+	if(quote.get("id") != null)
+	{
+		recordExists = true;
+	}
+}
+// ---- 1b. 入口ガード（v7）: 承認中のレコードは getRecordById が status だけの Map（id キー無し）を返して読めない ----
+// null に containKey を呼ばないよう、null チェックを先に行う
+recordUnreadable = false;
+if(quote == null)
+{
+	recordUnreadable = true;
+}
+else
+{
+	if(!quote.containKey("id"))
+	{
+		recordUnreadable = true;
+	}
+}
+if(recordUnreadable)
+{
+	mode = "SKIP";
+	reason = "record not readable (in approval)";
+	info "入口ガード: レコードが読めない（承認中の可能性）ため書き込まずに終了する 応答=" + quote;
+}
+// ---- 2. 取得検査（レコード無しは書かずにログのみ。必須キーは Sub_Total だけ）----
+if(!recordExists)
+{
+	// v7: 入口ガードの SKIP を上書きしない
+	if(mode == "")
+	{
+		mode = "ABORT";
+		reason = "record not returned";
+		failureKind = "FETCH-FAILED";
+		info "取得失敗: 応答=" + quote;
+	}
+}
+else
+{
+	if(!quote.containKey("Sub_Total"))
+	{
+		mode = "REVIEW";
+		reason = "Sub_Total missing in response";
+		failureKind = "FETCH-INCOMPLETE";
+		info "取得失敗: Sub_Total が応答に無い";
+	}
+}
+// ---- 3a. 税合計の算出（Product_Details の各行の Tax の合計。形が想定外なら fail-closed: PD-SHAPE）----
+taxTotal = ZERO;
+taxSource = "Product_Details.Tax";
+pdRowCount = 0;
+if(mode == "")
+{
+	pdShapeOk = true;
+	pdShapeReason = "";
+	pdRows = List();
+	pdRaw = quote.get("Product_Details");
+	// v5: 明細値の形は判定しない（複数行でも toString の先頭は "{" で、先頭文字による形判定は不成立）。
+	// キーの有無と null だけを確かめ、生値を for each で直接反復して各行を toMap() で変換し pdRows に集める
+	if(!quote.containKey("Product_Details"))
+	{
+		pdShapeOk = false;
+		pdShapeReason = "Product_Details missing";
+	}
+	else if(pdRaw == null)
+	{
+		pdShapeOk = false;
+		pdShapeReason = "Product_Details is null";
+	}
+	else
+	{
+		// 反復対象は null で事前初期化せず、for each の直前に応答から直接代入する（保存が通った実績のある形）
+		pdIter = quote.get("Product_Details");
+		// 反復そのものの失敗（反復できない型など）も PD-SHAPE に倒す。try で囲むのはループ側だけ
+		try
+		{
+			for each  pdRow in pdIter
+			{
+				rowConvOk = false;
+				rowConvFailed = false;
+				if(pdRow != null)
+				{
+					// 明細行は KEY-VALUE 型ではないので、toMap() で本物の Map に変換してから集める（T4。行ごとの try/catch）
+					try
+					{
+						rowMap = pdRow.toMap();
+						pdRows.add(rowMap);
+						rowConvOk = true;
+					}
+					catch (rowConvErr)
+					{
+						rowConvFailed = true;
+						info "行変換失敗: toMap() で例外 " + rowConvErr;
+					}
+				}
+				if(!rowConvOk)
+				{
+					pdShapeOk = false;
+					if(rowConvFailed)
+					{
+						pdShapeReason = "Product_Details row conversion failed";
+					}
+					else
+					{
+						pdShapeReason = "Product_Details row without Tax";
+					}
+				}
+			}
+		}
+		catch (pdIterErr)
+		{
+			pdShapeOk = false;
+			// ループ内で既に失敗理由が設定されていればそちらを優先する
+			if(pdShapeReason == "")
+			{
+				pdShapeReason = "Product_Details iteration failed";
+			}
+			info "明細の反復失敗: for each で例外 " + pdIterErr;
+		}
+	}
+	// 明細0行は税 0 で計算せず PD-SHAPE に倒す
+	if(pdShapeOk)
+	{
+		pdRowCount = pdRows.size();
+		if(pdRowCount == 0)
+		{
+			pdShapeOk = false;
+			pdShapeReason = "Product_Details has no rows";
+		}
+	}
+	// 各行（toMap() 済みの Map）: Tax キーがあること・Tax が null／空でないことを確かめてから足す（税 0 で代用しない）
+	if(pdShapeOk)
+	{
+		for each  pdRowMap in pdRows
+		{
+			rowOk = false;
+			if(pdRowMap.containKey("Tax"))
+			{
+				rowTaxRaw = pdRowMap.get("Tax");
+				if(rowTaxRaw != null)
+				{
+					rowTaxStr = rowTaxRaw.toString();
+					if(rowTaxStr != "")
+					{
+						rowTax = rowTaxStr.toDecimal();
+						taxTotal = taxTotal + rowTax;
+						rowOk = true;
+					}
+				}
+			}
+			if(!rowOk)
+			{
+				pdShapeOk = false;
+				pdShapeReason = "Product_Details row without Tax";
+			}
+		}
+	}
+	info "税: source=" + taxSource + " 行数=" + pdRowCount + " 合計=" + taxTotal;
+	if(!pdShapeOk)
+	{
+		mode = "REVIEW";
+		reason = pdShapeReason;
+		failureKind = "PD-SHAPE";
+		info "評価不能: Product_Details の形が想定外（" + pdShapeReason + "） 応答のProduct_Details=" + pdRaw;
+	}
+}
+// ---- 3b. 計算とガード（分母 ≤ 0、範囲外）----
+if(mode == "")
+{
+	subTotal = ifnull(quote.get("Sub_Total"),0).toDecimal();
+	discount = ifnull(quote.get("Discount"),0).toDecimal();
+	tax = taxTotal;
+	adjustment = ifnull(quote.get("Adjustment"),0).toDecimal();
+	// min(Adjustment, 0)
+	negAdjustment = ZERO;
+	if(adjustment < ZERO)
+	{
+		negAdjustment = adjustment;
+	}
+	discountAmount = discount - negAdjustment;
+	denominator = subTotal - tax;
+	info "入力: Sub_Total=" + subTotal + " Discount=" + discount + " Tax=" + tax + " (" + taxSource + ") Adjustment=" + adjustment;
+	if(denominator <= ZERO)
+	{
+		mode = "REVIEW";
+		reason = "denominator (Sub_Total - Tax) <= 0";
+		failureKind = "DENOMINATOR";
+		info "評価不能: 分母 ≤ 0 denominator=" + denominator;
+	}
+	else
+	{
+		// 保存時に Zoho が (x).method() の括弧を外すため、いったん変数に入れてから丸める
+		rawPct = discountAmount / denominator * 100;
+		pct = rawPct.round(2);
+		info "計算: rawPct=" + rawPct + " pct=" + pct;
+		if(pct < ZERO || pct > HUNDRED)
+		{
+			mode = "REVIEW";
+			reason = "pct out of range [0,100]";
+			failureKind = "OUT-OF-RANGE";
+			info "評価不能: 範囲外 pct=" + pct;
+		}
+	}
+}
+// ---- 4. 段階の判定と状態ガード（D9）----
+if(mode == "")
+{
+	if(pct < MANAGER_THRESHOLD)
+	{
+		newStatus = STATUS_AUTO;
+		newLevel = LEVEL_AUTO;
+	}
+	else if(pct < VP_THRESHOLD)
+	{
+		newStatus = STATUS_MANAGER;
+		newLevel = LEVEL_MANAGER;
+	}
+	else
+	{
+		newStatus = STATUS_VP;
+		newLevel = LEVEL_VP;
+	}
+	storedStatus = ifnull(quote.get("Approval_Status"),"");
+	storedLevel = ifnull(quote.get("Approval_Level"),"");
+	storedPctRaw = quote.get("Discount_Percentage");
+	hasStoredPct = false;
+	storedPct = ZERO;
+	if(storedPctRaw != null)
+	{
+		if(storedPctRaw.toString() != "")
+		{
+			storedPct = storedPctRaw.toString().toDecimal().round(2);
+			hasStoredPct = true;
+		}
+	}
+	mode = "NORMAL";
+	if(hasStoredPct && storedStatus == STATUS_APPROVED && pct == storedPct)
+	{
+		mode = "SKIP";
+		reason = "already Approved at same pct";
+	}
+	if(hasStoredPct && storedStatus == STATUS_REJECTED && pct == storedPct && newLevel == storedLevel)
+	{
+		mode = "SKIP";
+		reason = "already Rejected at same pct and level";
+	}
+	if(mode == "SKIP")
+	{
+		info "状態ガード: 更新しない（" + reason + "）";
+	}
+}
+// ---- 5. 通常の書き込み（trigger に approval を明示。空リストは禁止）----
+if(mode == "NORMAL")
+{
+	updateMap = Map();
+	updateMap.put("Discount_Percentage",pct);
+	updateMap.put("Approval_Status",newStatus);
+	updateMap.put("Approval_Level",newLevel);
+	updateTrigger = List();
+	updateTrigger.add("approval");
+	updateOptMap = Map();
+	updateOptMap.put("trigger",updateTrigger);
+	updateResp = zoho.crm.updateRecord("Quotes",recordId,updateMap,updateOptMap);
+	info "更新応答: " + updateResp;
+	updateOk = false;
+	if(updateResp != null)
+	{
+		if(updateResp.get("id") != null)
+		{
+			updateOk = true;
+		}
+	}
+	if(!updateOk)
+	{
+		mode = "REVIEW";
+		reason = "updateRecord error";
+		failureKind = "UPDATE-ERROR";
+	}
+}
+// ---- 6. 読み戻し検査（Decimal・小数2桁で比較）----
+if(mode == "NORMAL")
+{
+	readBack = zoho.crm.getRecordById("Quotes",recordId);
+	readBackOk = false;
+	if(readBack != null)
+	{
+		if(readBack.get("id") != null)
+		{
+			readBackOk = true;
+		}
+	}
+	if(!readBackOk)
+	{
+		// v7: 目標が Pending 系なら承認プロセスへ投入済みで、承認ロックにより読めないのは正常な帰結（異常にしない）
+		if(newStatus == STATUS_MANAGER || newStatus == STATUS_VP)
+		{
+			mode = "SUBMITTED";
+			info "読み戻し保留: 承認プロセスへ投入済み（目標=" + newStatus + "）。承認ロックのため読み戻しできないのは正常な帰結であり、検証は保留して NMR は書かない 応答=" + readBack;
+		}
+		else
+		{
+			mode = "REVIEW";
+			reason = "read-back fetch failed";
+			failureKind = "READBACK-MISMATCH";
+			info "読み戻し失敗: 応答=" + readBack;
+		}
+	}
+	else
+	{
+		rbPctRaw = readBack.get("Discount_Percentage");
+		rbStatus = ifnull(readBack.get("Approval_Status"),"");
+		rbMatch = false;
+		if(rbPctRaw != null)
+		{
+			if(rbPctRaw.toString() != "")
+			{
+				rbPct = rbPctRaw.toString().toDecimal().round(2);
+				if(rbPct == pct && rbStatus == newStatus)
+				{
+					rbMatch = true;
+				}
+			}
+		}
+		if(!rbMatch)
+		{
+			mode = "REVIEW";
+			reason = "read-back mismatch";
+			failureKind = "READBACK-MISMATCH";
+			info "読み戻し不一致: Discount_Percentage=" + rbPctRaw + " Approval_Status=" + rbStatus;
+		}
+	}
+}
+// ---- 7. 競合検知（読み戻した最新値で再計算。税はステップ3a と同じロジック）----
+if(mode == "NORMAL")
+{
+	fTaxTotal = ZERO;
+	fTaxSource = "Product_Details.Tax";
+	fPdShapeOk = true;
+	fPdShapeReason = "";
+	fPdRowCount = 0;
+	fPdRows = List();
+	fPdRaw = readBack.get("Product_Details");
+	// v5: ステップ3a と同じ。形は判定せず、生値を for each で直接反復して各行を toMap() で変換し fPdRows に集める
+	if(!readBack.containKey("Product_Details"))
+	{
+		fPdShapeOk = false;
+		fPdShapeReason = "Product_Details missing";
+	}
+	else if(fPdRaw == null)
+	{
+		fPdShapeOk = false;
+		fPdShapeReason = "Product_Details is null";
+	}
+	else
+	{
+		// 反復対象は null で事前初期化せず、for each の直前に応答から直接代入する（保存が通った実績のある形）
+		fPdIter = readBack.get("Product_Details");
+		// 反復そのものの失敗（反復できない型など）も PD-SHAPE に倒す。try で囲むのはループ側だけ（ステップ3a と同じ）
+		try
+		{
+			for each  fPdRow in fPdIter
+			{
+				fRowConvOk = false;
+				fRowConvFailed = false;
+				if(fPdRow != null)
+				{
+					// 明細行は KEY-VALUE 型ではないので、toMap() で本物の Map に変換してから集める（T4。行ごとの try/catch）
+					try
+					{
+						fRowMap = fPdRow.toMap();
+						fPdRows.add(fRowMap);
+						fRowConvOk = true;
+					}
+					catch (fRowConvErr)
+					{
+						fRowConvFailed = true;
+						info "競合検知の行変換失敗: toMap() で例外 " + fRowConvErr;
+					}
+				}
+				if(!fRowConvOk)
+				{
+					fPdShapeOk = false;
+					if(fRowConvFailed)
+					{
+						fPdShapeReason = "Product_Details row conversion failed";
+					}
+					else
+					{
+						fPdShapeReason = "Product_Details row without Tax";
+					}
+				}
+			}
+		}
+		catch (fPdIterErr)
+		{
+			fPdShapeOk = false;
+			// ループ内で既に失敗理由が設定されていればそちらを優先する
+			if(fPdShapeReason == "")
+			{
+				fPdShapeReason = "Product_Details iteration failed";
+			}
+			info "競合検知の明細の反復失敗: for each で例外 " + fPdIterErr;
+		}
+	}
+	// 明細0行は PD-SHAPE 扱い（ステップ3a と同じ）
+	if(fPdShapeOk)
+	{
+		fPdRowCount = fPdRows.size();
+		if(fPdRowCount == 0)
+		{
+			fPdShapeOk = false;
+			fPdShapeReason = "Product_Details has no rows";
+		}
+	}
+	// 各行（toMap() 済みの Map）の Tax を合計する（ステップ3a と同じ。Tax が取れない行は PD-SHAPE 扱い）
+	if(fPdShapeOk)
+	{
+		for each  fPdRowMap in fPdRows
+		{
+			fRowOk = false;
+			if(fPdRowMap.containKey("Tax"))
+			{
+				fRowTaxRaw = fPdRowMap.get("Tax");
+				if(fRowTaxRaw != null)
+				{
+					fRowTaxStr = fRowTaxRaw.toString();
+					if(fRowTaxStr != "")
+					{
+						fRowTax = fRowTaxStr.toDecimal();
+						fTaxTotal = fTaxTotal + fRowTax;
+						fRowOk = true;
+					}
+				}
+			}
+			if(!fRowOk)
+			{
+				fPdShapeOk = false;
+				fPdShapeReason = "Product_Details row without Tax";
+			}
+		}
+	}
+	fSubTotal = ifnull(readBack.get("Sub_Total"),0).toDecimal();
+	fDiscount = ifnull(readBack.get("Discount"),0).toDecimal();
+	fAdjustment = ifnull(readBack.get("Adjustment"),0).toDecimal();
+	fNegAdjustment = ZERO;
+	if(fAdjustment < ZERO)
+	{
+		fNegAdjustment = fAdjustment;
+	}
+	fDiscountAmount = fDiscount - fNegAdjustment;
+	fDenominator = fSubTotal - fTaxTotal;
+	conflict = false;
+	if(!fPdShapeOk)
+	{
+		conflict = true;
+		info "競合検知: 読み戻しの Product_Details の形が想定外（" + fPdShapeReason + "） 応答のProduct_Details=" + fPdRaw;
+	}
+	else if(fDenominator <= ZERO)
+	{
+		conflict = true;
+		info "競合検知: 読み戻し値の分母 ≤ 0 denominator=" + fDenominator;
+	}
+	else
+	{
+		// 保存時に Zoho が (x).method() の括弧を外すため、いったん変数に入れてから丸める
+		fRawPct = fDiscountAmount / fDenominator * 100;
+		fPct = fRawPct.round(2);
+		if(fPct != pct)
+		{
+			conflict = true;
+			info "競合検知: 最新値で再計算した率が保存した率と違う fPct=" + fPct + " pct=" + pct + " 税source=" + fTaxSource + " 行数=" + fPdRowCount;
+		}
+	}
+	if(conflict)
+	{
+		mode = "REVIEW";
+		reason = "conflict: recomputed pct differs after write";
+		failureKind = "CONFLICT";
+	}
+}
+// ---- 8. Needs Manual Review の書き込み（Discount_Percentage は含めない）----
+if(mode == "REVIEW")
+{
+	reviewMap = Map();
+	reviewMap.put("Approval_Status",STATUS_REVIEW);
+	reviewMap.put("Approval_Level",LEVEL_REVIEW);
+	reviewTrigger = List();
+	reviewTrigger.add("approval");
+	reviewOptMap = Map();
+	reviewOptMap.put("trigger",reviewTrigger);
+	reviewResp = zoho.crm.updateRecord("Quotes",recordId,reviewMap,reviewOptMap);
+	info "Needs Manual Review 更新応答: " + reviewResp;
+	reviewOk = false;
+	if(reviewResp != null)
+	{
+		if(reviewResp.get("id") != null)
+		{
+			reviewOk = true;
+		}
+	}
+	if(!reviewOk)
+	{
+		if(failureKind == "")
+		{
+			failureKind = "REVIEW-WRITE-FAILED";
+		}
+		else
+		{
+			failureKind = failureKind + " + REVIEW-WRITE-FAILED";
+		}
+		info "Needs Manual Review の書き込みに失敗（日次ダイジェストには載らない。実行ログで確認すること）";
+	}
+}
+// ---- 結果の文字列とログ（メール通知は廃止）----
+if(mode == "NORMAL")
+{
+	resultMsg = "OK " + newStatus + " " + pct;
+}
+else if(mode == "SUBMITTED")
+{
+	resultMsg = "OK " + newStatus + " " + pct + " (submitted, read-back skipped)";
+}
+else if(mode == "SKIP")
+{
+	resultMsg = "SKIP " + reason;
+}
+else if(mode == "REVIEW")
+{
+	resultMsg = "REVIEW " + reason;
+}
+else
+{
+	resultMsg = "ABORT " + reason;
+}
+if(failureKind != "")
+{
+	info "異常分類: " + failureKind;
+}
+info "終了: " + resultMsg;
+return resultMsg;

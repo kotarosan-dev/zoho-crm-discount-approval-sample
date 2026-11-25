@@ -1,0 +1,13 @@
+// ============================================================
+// function_name : quote_approval_review_digest_sched (schedule wrapper)
+// purpose       : Lets a daily schedule run the standalone function
+//                 standalone.quote_approval_review_digest. A schedule cannot run
+//                 a standalone function directly, and schedule-category functions
+//                 return void, so register this file as a schedule function and
+//                 set it to run once a day.
+// argument      : none
+//                 Note: this file holds only the function body. Add the declaration
+//                 in the Zoho CRM function editor.
+// related       : quote_approval_review_digest.deluge (the function body that does the work)
+// ============================================================
+standalone.quote_approval_review_digest();

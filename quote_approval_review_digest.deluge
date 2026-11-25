@@ -1,0 +1,293 @@
+// ============================================================
+// function_name : Quote_Approval_Review_Digest
+// label_name    : 要手動確認の見積を日次で管理者へまとめて通知する
+// 引数          : なし
+//                 ※ 本ファイルは関数本体のみ。宣言はエディタ側で付ける
+//                 ※ 宣言名は小文字スネークケース: string standalone.quote_approval_review_digest()
+//                 ※ スケジュール（設定 → 自動化 → スケジュール、日次）からは schedule カテゴリのラッパー経由で呼ぶ想定。
+//                   schedule カテゴリの戻り値は voidなので、ラッパー本体は1行:
+//                   standalone.quote_approval_review_digest();
+// 戻り値        : string（処理結果の短い説明）
+//
+// motivation（目的）:
+//   Set_Quote_Approval_Level v2 はレコード単位のメールを送らない。
+//   代わりに本関数が、直近24時間に Approval_Status = Needs Manual Review になった見積を集計し、
+//   管理者へ 1日1通だけメールする。0件ならメールしない。
+//
+// 通知予算: 1日最大1通。
+//   ・sendmail はループの外に1か所だけ置き、件数 > 0 のときに1回だけ実行する。
+//   ・スケジュールは1日1回で登録する（複数回の登録・手動の再実行をすると、その回数だけ送られる）。
+//   ・検索が失敗した場合はメールを送らず、info ログに残して異常終了する（"FAILED ..." を返す）。
+//     失敗時にメールを連発しない設計。失敗は関数の実行ログで確認し、必要なら手動で再実行する。
+//
+// 取得方法と「直近24時間」の判定（選んだ方法: 検索はステータスのみ、時刻はコード側で絞る）:
+//   zoho.crm.searchRecords で Quotes を、ステータスの1条件だけで検索する。
+//     (Approval_Status:equals:Needs Manual Review)
+//   ・経緯: 当初は検索条件に Modified_Time の下限も入れていたが、2026-11-11 の手動実行2回とも検索が失敗した
+//     （どちらもメールは送られず、設計どおり異常終了）。
+//       1回目 Modified_Time:greater_than:<24時間前> → INVALID_QUERY / invalid operator found
+//       2回目 Modified_Time:after:<24時間前>        → INVALID_QUERY / invalid operator found
+//     searchRecords の条件では Modified_Time に日時比較の演算子が使えないと判断し、検索はステータスのみ、
+//     時刻の絞り込みはコード側で行う設計に変えた。
+//     検索の原則は COQL だが、COQL は invokeurl 経路の接続が要るため本件では採らない。
+//   ・Approval_Status は Picklist 項目。Search の equals は picklist では厳密一致。
+//     念のため、返ってきた各レコードの Approval_Status もコード側で完全一致を再確認する。
+//   ・時刻の絞り込み（toTime は使わない）: 旧版は Modified_Time の先頭19文字を toTime で日時化して比べていたが、
+//     toTime がどのタイムゾーンで解釈するかが未確認で、実行環境の既定（JST と17時間差。下の実測 (c)）なら
+//     窓が最大17時間ずれる。そこで日時化をやめ、両辺とも JST の壁時計の文字列（yyyy-MM-dd'T'HH:mm:ss の19文字）に
+//     そろえて比べる方式にした。
+//       左辺: 各レコードの Modified_Time の先頭19文字（modLocal）
+//       右辺: windowStart.toString("yyyy-MM-dd'T'HH:mm:ss","Asia/Tokyo")（windowStartWall）
+//     ゼロ埋めの ISO 8601 同士なので、辞書順＝時刻順になる。ただし TEXT 同士の < > は使えないため、
+//     両辺から区切り（- T :）を除いた14桁（yyyyMMddHHmmss）を toLong して数値で比べる（辞書順と同じ順序）。
+//     modLocal が windowStartWall より新しい場合だけ一覧に載せる。
+//     subString は長さ超過でエラーになるため、19文字未満・14桁の数値にならない値は
+//     「解析できない」として一覧に載せず info ログに残す。除外したレコードは info ログに id を出す。
+//   ・前提: Modified_Time は +09:00（JST）のオフセット付き ISO 8601 で返る（実測。例 2026-11-09T09:00:00+09:00）。
+//     先頭19文字はそのまま JST の壁時計なので、右辺も "Asia/Tokyo" を明示して JST の壁時計で作る。
+//     組織のタイムゾーンを JST 以外に変えた場合は、右辺の "Asia/Tokyo" と TZ_OFFSET を合わせて変える。
+//     TZ_OFFSET（"+09:00"）は、メール本文と info ログに出す windowStartIso（windowStartWall + TZ_OFFSET）の表示用にだけ使う。
+//   ・旧版の【要実測】「検索条件の "+09:00" の "+" が URL 上で空白に化けないか」は、条件文字列に時刻が
+//     含まれなくなったため該当しない。
+//   ・【要実測】subHour は Deluge の日時関数として使う前提（保存時に確認する）。
+//   ・【要実測】Modified_Time の応答の書式（先頭19文字が yyyy-MM-dd'T'HH:mm:ss であること）。初回の手動実行で
+//     info ログの「対象外」「一覧」の件数と Modified の値を確かめる。
+//
+// 実測（2026-11-11 の手動実行）:
+//   (a) searchRecords は HTTP 200 で成功しても、応答の toString() が "{" で始まることがある
+//       （18:51 の実行で、中身は見積レコードの List だったのに "FAILED search error" になった。明細値と同じ罠）。
+//       「toString() の先頭が [ かで List を判定」は検索応答には使えない。
+//       対策: 形は containKey で判定する。null → 失敗／containKey("code") → エラー応答で失敗／
+//       containKey("id") → 単一レコードの Map／それ以外（containKey が例外の場合を含む）→ List。
+//       containKey は List に対して呼ぶと例外になるため、必ず try/catch で囲む。
+//   (b) Modified_Time の greater_than／after はともに INVALID_QUERY（invalid operator found）。
+//       検索はステータスのみ、時刻はコード側で絞る（上記の経緯）。
+//   (c) タイムゾーン指定なしの windowStart.toString(...) は実行環境の既定タイムゾーンで印字された。
+//       実行 11/11 18:51 JST に対し「対象期間の下限」が 2026-11-10T01:51:51+09:00 と出た
+//       （正しくは 11/10 18:51。17時間早い＝JST と PST の差）。比較に使う windowStart の日時値は
+//       正しい前提で、表示文字列だけの問題とみる。対策: toString にタイムゾーン "Asia/Tokyo" を指定する。
+//       【要実測】次回の手動実行で「対象期間の下限」が実行時刻のちょうど24時間前になることを確かめる。
+//       toTime（Modified_Time の切り出し）も既定タイムゾーンで解釈される恐れがあったため、比較は toTime をやめ、
+//       JST の壁時計の文字列どうし（数値化して比較）に変えた（上の「時刻の絞り込み」）。
+//
+// Search を使う理由とインデックス遅延の許容:
+//   検索の原則は「検索は COQL」だが、本件では searchRecords を使う。
+//   Search は作成・更新の直後にインデックスの反映が遅れる（1分以上〜30分で安定）。日次バッチなので、
+//   ステータスのみで検索するため、24時間より前に Needs Manual Review になったまま残っている見積も返り、
+//   コード側で除外される（1回の検索で取れる上限 2,000 件にはこれらも含まれる）。
+//   遅延の影響は「実行の直前数分〜数十分に Needs Manual Review になった見積が当日の通知から漏れうる」ことに限られる。
+//   漏れた見積は、翌日の実行時点で Modified_Time が24時間より前なら翌日にも載らない。
+//   これを許容できない場合は WINDOW_HOURS を 25 等に広げる（重複して載るだけで、通数は増えない）。
+//   1回の検索で取れるのは合計 2,000 件まで（200件 × 10ページ）。上限に達した場合は本文に「打ち切り」と書く。
+//
+// メール:
+//   件名: [Quote Approval] Daily digest - N quote(s) need manual review
+//   本文: 件数と、各見積の Quote_Number（無ければ ID）・Subject・ID・Modified_Time の一覧
+//   宛先: ADMIN_EMAIL。from: zoho.loginuserid（zoho.adminuserid は新規保存不可。2026-11-10 に実測）
+//   ※ Quote_Number は見積番号の API 名として想定（未実測）。応答に無い・空なら ID を表示する。
+//
+// processing_flow:
+//   1 24時間前の時刻（日時値と表示用の ISO 8601 文字列）を作る → 2 searchRecords（ステータスのみ）をページ送り（最大10ページ）→
+//   3 失敗なら info ログを出して終了（メールなし）→ 4 Approval_Status を再確認し、Modified_Time が24時間以内のものだけで一覧を作る →
+//   5 0件なら終了（メールなし）→ 6 1通だけ sendmail
+//
+// 実装上の注意（実測に基づく）:
+//   Search の picklist equals は厳密一致／インデックス遅延あり（日次バッチなので許容）／合計2,000件まで
+//   schedule カテゴリの戻り値は void → standalone 本体＋schedule ラッパー
+//   三項演算子・行末コメント・文字列連結への式埋め込みは使わない／TEXT 同士の大小比較はしない（壁時計の14桁を toLong で変換）
+//   subString は長さを確認してから。リスト判定（toString() が "[" で始まるか）は検索応答には使えない（実測 (a)）ため、
+//        containKey（try/catch 付き）で判定する
+//   sendmail の from は zoho.loginuserid
+//   null にメソッドを呼ばない（Modified_Time は ifnull で文字列にしてから切り出す）
+//   日時はオフセット付き ISO 8601 で扱う（検索条件には時刻を入れなくなったので、表示用のみ）
+//
+// related_functions: Set_Quote_Approval_Level（v2。Needs Manual Review を書く側）
+// ============================================================
+
+// ---- 設定（組織ごとの変更点）----
+// 管理者通知の宛先。組織ごとに変更する
+ADMIN_EMAIL = "admin@example.com";
+STATUS_REVIEW = "Needs Manual Review";
+// 組織のタイムゾーンのオフセット（前提: JST。windowStartIso の表示用）
+TZ_OFFSET = "+09:00";
+WINDOW_HOURS = 24;
+PER_PAGE = 200;
+PAGE_LIST = {1,2,3,4,5,6,7,8,9,10};
+info "開始: Quote_Approval_Review_Digest";
+// ---- 1. 24時間前の時刻（比較用の日時値と、表示用の ISO 8601 文字列）----
+windowStart = zoho.currenttime.subHour(WINDOW_HOURS);
+// 比較・表示とも JST の壁時計の19文字にする（タイムゾーン指定なしの toString は実行環境の既定で印字され、17時間ずれた実測あり）
+windowStartWall = windowStart.toString("yyyy-MM-dd'T'HH:mm:ss","Asia/Tokyo");
+windowStartIso = windowStartWall + TZ_OFFSET;
+// 比較用に区切りを除いた14桁（yyyyMMddHHmmss）を数値にする（TEXT 同士の大小比較は使えないため）
+windowStartDigits = windowStartWall.replaceAll("-","");
+windowStartDigits = windowStartDigits.replaceAll("T","");
+windowStartDigits = windowStartDigits.replaceAll(":","");
+windowStartNum = windowStartDigits.toLong();
+info "対象期間の下限: " + windowStartIso + " 比較値=" + windowStartNum;
+// 検索はステータスのみ（Modified_Time の比較演算子は searchRecords で INVALID_QUERY になるため）
+criteria = "((Approval_Status:equals:" + STATUS_REVIEW + "))";
+info "検索条件: " + criteria;
+// ---- 2. 検索（ページ送り。失敗したら打ち切り）----
+searchFailed = false;
+truncated = false;
+records = List();
+for each  pageNo in PAGE_LIST
+{
+	pageResp = zoho.crm.searchRecords("Quotes",criteria,pageNo,PER_PAGE);
+	if(pageResp == null)
+	{
+		searchFailed = true;
+		info "検索失敗: page=" + pageNo + " 応答=null";
+		break;
+	}
+	// 応答の形は containKey で見る（toString の先頭文字は List でも "{" になることがある）。
+	// containKey は List に対して呼ぶと例外になるため、必ず try/catch で囲む
+	isErrorResp = false;
+	try
+	{
+		isErrorResp = pageResp.containKey("code");
+	}
+	catch (errCode)
+	{
+		isErrorResp = false;
+	}
+	if(isErrorResp)
+	{
+		searchFailed = true;
+		info "検索失敗: page=" + pageNo + " 応答=" + pageResp;
+		break;
+	}
+	isSingleRec = false;
+	try
+	{
+		isSingleRec = pageResp.containKey("id");
+	}
+	catch (errId)
+	{
+		isSingleRec = false;
+	}
+	pageSize = 0;
+	if(isSingleRec)
+	{
+		// 単一レコードの Map として返った場合
+		records.add(pageResp);
+		pageSize = 1;
+	}
+	else
+	{
+		// List として扱う（containKey で例外が出た場合を含む）
+		pageSize = pageResp.size();
+		records.addAll(pageResp);
+	}
+	info "検索: page=" + pageNo + " 件数=" + pageSize;
+	if(pageSize < PER_PAGE)
+	{
+		break;
+	}
+	if(pageNo == 10)
+	{
+		truncated = true;
+	}
+}
+// ---- 3. 検索失敗はメールを送らず異常終了（通知予算を守る）----
+if(searchFailed)
+{
+	info "終了: 検索失敗のためメールは送らない";
+	return "FAILED search error";
+}
+// ---- 4. 一覧の作成（Approval_Status の完全一致を再確認し、Modified_Time が24時間以内のものだけ載せる）----
+lines = "";
+matchCount = 0;
+for each  rec in records
+{
+	recStatus = ifnull(rec.get("Approval_Status"),"");
+	if(recStatus == STATUS_REVIEW)
+	{
+		recId = ifnull(rec.get("id"),"").toString();
+		modTime = ifnull(rec.get("Modified_Time"),"").toString();
+		// Modified_Time の先頭19文字（JST の壁時計）を、windowStartWall と同じ14桁の数値にして比べる（toTime は使わない）
+		modParsed = false;
+		inWindow = false;
+		modLen = modTime.length();
+		if(modLen >= 19)
+		{
+			modLocal = modTime.subString(0,19);
+			modDigits = modLocal.replaceAll("-","");
+			modDigits = modDigits.replaceAll("T","");
+			modDigits = modDigits.replaceAll(":","");
+			modDigitsLen = modDigits.length();
+			if(modDigitsLen == 14)
+			{
+				modNum = null;
+				try
+				{
+					modNum = modDigits.toLong();
+				}
+				catch (errMod)
+				{
+					modNum = null;
+				}
+				if(modNum != null)
+				{
+					modParsed = true;
+					if(modNum > windowStartNum)
+					{
+						inWindow = true;
+					}
+				}
+			}
+		}
+		if(inWindow)
+		{
+			quoteNo = ifnull(rec.get("Quote_Number"),"").toString();
+			if(quoteNo == "")
+			{
+				quoteNo = recId;
+			}
+			subj = ifnull(rec.get("Subject"),"").toString();
+			subj = subj.replaceAll("&","&amp;");
+			subj = subj.replaceAll("<","&lt;");
+			subj = subj.replaceAll(">","&gt;");
+			matchCount = matchCount + 1;
+			lines = lines + "<li>" + quoteNo + " | " + subj + " | ID: " + recId + " | Modified: " + modTime + "</li>";
+		}
+		else if(modParsed)
+		{
+			info "対象外（24時間より前）: id=" + recId + " Modified=" + modTime;
+		}
+		else
+		{
+			info "対象外（Modified_Time を解析できない）: id=" + recId + " Modified=" + modTime;
+		}
+	}
+	else
+	{
+		skipId = ifnull(rec.get("id"),"").toString();
+		info "除外（Approval_Status 不一致）: id=" + skipId + " status=" + recStatus;
+	}
+}
+info "対象件数: " + matchCount;
+// ---- 5. 0件ならメールしない ----
+if(matchCount == 0)
+{
+	info "終了: 対象0件のためメールは送らない";
+	return "OK 0 quotes, no mail";
+}
+// ---- 6. 1日1通だけ送る（sendmail はこの1か所のみ）----
+mailSubject = "[Quote Approval] Daily digest - " + matchCount + " quote(s) need manual review";
+truncNote = "";
+if(truncated)
+{
+	truncNote = "<br><b>Note:</b> the search reached the 2,000-record limit; the list may be truncated.";
+}
+mailBody = "Quotes set to Needs Manual Review in the last " + WINDOW_HOURS + " hours (since " + windowStartIso + "): " + matchCount + "<br><ul>" + lines + "</ul>" + truncNote + "<br>Please review these quotes manually.";
+sendmail
+[
+	from :zoho.loginuserid
+	to :ADMIN_EMAIL
+	subject :mailSubject
+	message :mailBody
+]
+info "終了: ダイジェストを送信 件数=" + matchCount;
+return "OK " + matchCount + " quotes, mail sent";
